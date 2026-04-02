@@ -1,9 +1,12 @@
 import CircuitBreaker from 'opossum';
-import { HttpsProxyAgent } from 'hpagent';
 import { logger } from '../logger';
 import { config } from '../../config/env';
 import { SessionExpiredError, RiskControlError } from '../../domain/errors/midas.errors';
-import { gotScraping } from 'got-scraping';
+import { chromium } from 'playwright-extra';
+import stealth from 'puppeteer-extra-plugin-stealth';
+
+// @ts-ignore
+chromium.use(stealth());
 
 export interface RedeemResponse {
   success: boolean;
@@ -46,110 +49,118 @@ export class MidasHttpClient {
     proxyUrl?: string | null
   ): Promise<RedeemResponse> {
     try {
-      // Create an HTTPS agent with a custom socket factory to mimic browser TLS
-      // got-scraping handles the TLS fingerprinting automatically
-      const agent = proxyUrl ? {
-        https: new HttpsProxyAgent({
-          keepAlive: true,
-          proxy: proxyUrl,
-        }),
-      } : undefined;
+      let proxyOptions: any = undefined;
+      if (proxyUrl) {
+        proxyOptions = { server: proxyUrl };
+        try {
+          const url = new URL(proxyUrl);
+          if (url.username || url.password) {
+            proxyOptions = {
+              server: `${url.protocol}//${url.host}`,
+              username: url.username,
+              password: url.password,
+            };
+          }
+        } catch (e) {
+          logger.warn('Failed to parse proxy URL for playwright', { proxyUrl });
+        }
+      }
 
-      // Common headers that a real browser sends
-      const headers = {
-        'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Content-Type': 'application/json',
-        'Origin': 'https://www.midasbuy.com',
-        'Referer': 'https://www.midasbuy.com/midasbuy/mu/redeem/pubgm',
-        'Cookie': cookies,
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
-      };
-
-      // Midasbuy requires specific headers along with the session cookies
-      const response = await gotScraping({
-        url: 'https://www.midasbuy.com/midasbuy/mu/redeem/pubgm/QueryRedeemCodeInfo',
-        method: 'POST',
-        headers,
-        // The `agent` option in got-scraping requires a specific structure or can cause type errors if undefined.
-        // We only pass it if proxyUrl is set.
-        ...(agent ? { agent } : {}),
-        json: {
-          appid: playerId,
-          code: ucCode,
-          channel: 'mu',
-          from: '',
-          country: 'mu',
-          currency: 'USD',
-          payChannel: '',
-        },
-        responseType: 'json',
-        retry: { limit: 0 }, // We handle retries via BullMQ and Circuit Breaker
-        timeout: { request: 30000 },
+      const browser = await chromium.launch({
+        headless: true,
+        args: ['--no-sandbox', '--disable-setuid-sandbox'],
       });
 
-      // Midasbuy often returns 200 OK with a JSON body even for errors
-      let data: any;
       try {
-        if (typeof response.body === 'string') {
-          // Sometimes it returns HTML when blocked
-          if (response.body.includes('<html')) {
-             throw new Error('Blocked by Cloudflare/Captcha');
-          }
-          data = JSON.parse(response.body);
-        } else if (Buffer.isBuffer(response.body)) {
-          const strBody = response.body.toString('utf8');
-          if (strBody.includes('<html')) {
-             throw new Error('Blocked by Cloudflare/Captcha');
-          }
-          data = JSON.parse(strBody);
-        } else {
-          data = response.body;
-        }
-      } catch (e: any) {
-        logger.error({ bodyType: typeof response.body, msg: e.message }, 'Failed to parse Midasbuy response');
-        if (e.message === 'Blocked by Cloudflare/Captcha') {
-           throw new RiskControlError('Blocked by Cloudflare/Captcha');
-        }
-        throw new Error('Failed to parse Midasbuy response as JSON');
-      }
-
-      if (data.ret === 0 || data.msg === 'success' || data.msg?.toLowerCase().includes('success')) {
-        return {
-          success: true,
-          status: 'success',
-          reason: data.msg || 'Success',
-          raw_response: data,
+        const contextOptions: any = {
+          userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         };
-      }
+        if (proxyOptions) contextOptions.proxy = proxyOptions;
 
-      // Check for specific Midasbuy error codes
-      // Usually ret != 0 means error.
-      if (data.msg === 'login error' || data.ret === 10001 || data.msg?.includes('session')) {
-        throw new SessionExpiredError('Session expired or invalid cookies');
-      }
+        const context = await browser.newContext(contextOptions);
 
-      // Rate limit or risk control
-      if (data.msg?.toLowerCase().includes('risk') || data.ret === 10002) {
-        throw new RiskControlError(`Midasbuy risk control triggered: ${data.msg}`);
-      }
+        // Parse and add cookies
+        const cookieObjects = cookies.split('; ').map(c => {
+          const [name, ...rest] = c.split('=');
+          return {
+            name: name.trim(),
+            value: rest.join('=').trim(),
+            domain: '.midasbuy.com',
+            path: '/'
+          };
+        }).filter(c => c.name);
 
-      // 10005 often means invalid code or used code
-      if (data.ret === 10005) {
-         return {
+        await context.addCookies(cookieObjects);
+
+        const page = await context.newPage();
+        
+        // Go to the redeem page first to pass Cloudflare and get clearance
+        await page.goto('https://www.midasbuy.com/midasbuy/mu/redeem/pubgm', { waitUntil: 'domcontentloaded', timeout: 30000 });
+        
+        // Give it a moment to solve any JS challenge
+        await page.waitForTimeout(3000);
+
+        // Execute the redeem API call from within the browser context
+        const data = await page.evaluate(async ({ playerId, ucCode }) => {
+          const response = await fetch('https://www.midasbuy.com/midasbuy/mu/redeem/pubgm/QueryRedeemCodeInfo', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Accept': 'application/json, text/plain, */*'
+            },
+            body: JSON.stringify({
+              appid: playerId,
+              code: ucCode,
+              channel: 'mu',
+              from: '',
+              country: 'mu',
+              currency: 'USD',
+              payChannel: ''
+            })
+          });
+          return response.json();
+        }, { playerId, ucCode });
+
+        await browser.close();
+
+        if (data.ret === 0 || data.msg === 'success' || data.msg?.toLowerCase().includes('success')) {
+          return {
+            success: true,
+            status: 'success',
+            reason: data.msg || 'Success',
+            raw_response: data,
+          };
+        }
+
+        // Check for specific Midasbuy error codes
+        if (data.msg === 'login error' || data.ret === 10001 || data.msg?.includes('session')) {
+          throw new SessionExpiredError('Session expired or invalid cookies');
+        }
+
+        if (data.msg?.toLowerCase().includes('risk') || data.ret === 10002) {
+          throw new RiskControlError(`Midasbuy risk control triggered: ${data.msg}`);
+        }
+
+        if (data.ret === 10005) {
+           return {
+            success: false,
+            status: 'error',
+            reason: 'Invalid or already used UC code',
+            raw_response: data,
+          };
+        }
+
+        return {
           success: false,
           status: 'error',
-          reason: 'Invalid or already used UC code',
+          reason: data.msg || 'Failed to redeem code',
           raw_response: data,
         };
-      }
 
-      return {
-        success: false,
-        status: 'error',
-        reason: data.msg || 'Failed to redeem code',
-        raw_response: data,
-      };
+      } catch (innerError) {
+        await browser.close().catch(() => {});
+        throw innerError;
+      }
 
     } catch (error: any) {
       logger.error({ err: error.message }, 'HTTP Request to Midasbuy failed');
